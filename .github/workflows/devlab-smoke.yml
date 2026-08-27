@@ -1,0 +1,77 @@
+name: DevLab Ephemeral CI - smoke
+
+# Lives in rradjabi/ollama on devlab/ephemeral-ci as
+# .github/workflows/devlab-smoke.yml. Nothing watches rradjabi/ephemeral-ci, so
+# it does not run from where this copy lives. Issue #127.
+#
+# This is the first job in the ollama onboarding and it deliberately builds
+# nothing. Its whole purpose is to answer two questions that have to be answered
+# before a real job is worth writing: does a runner come up on a Halo when this
+# repository asks for one, and what is already installed on the box when it
+# does. Everything after this -- a ROCm build, a gfx1151 correctness test --
+# depends on both answers and neither is known today.
+#
+# The fork carries upstream's .github/workflows unmodified beside this file, and
+# that is safe rather than an oversight. Every workflow ollama ships is triggered
+# by `pull_request`, `release` or a `v*` tag push; not one fires on a branch
+# push. So pushing here runs this file and nothing else, and the fork stays a
+# clean mirror we can re-sync from instead of a patch series we have to
+# maintain. Do not add a `push:` trigger to this file without re-checking that.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    name: Strix Halo - Linux
+    # `ephemeral` alongside `strix-halo` is not redundant. It is the label that
+    # says this job wants a runner that does not exist yet, and it is what keeps
+    # the DevLab pool and the XSJ static runners from both answering. See
+    # pool.match_labels: a job naming only generic labels is refused outright.
+    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    steps:
+      - name: Hello
+        run: echo "Hello from $(hostname) - $(uname -sr)"
+
+      - name: Which slot ran this
+        run: |
+          echo "runner:    ${{ runner.name }}"
+          echo "workspace: ${GITHUB_WORKSPACE}"
+
+      - name: Accelerators
+        run: lspci -nn | grep -iE 'vga|display|processing accelerator' || echo "none reported"
+
+      # Reconnaissance, not a test. Every line here is allowed to report
+      # nothing, because the answer "ROCm is absent" is the useful one -- these
+      # four hosts were provisioned for XRT and the NPU, and whether they carry
+      # a usable HIP toolchain has never been established.
+      #
+      # It decides the next issue. ollama's own Linux job builds in
+      # rocm/dev-ubuntu-22.04:7.2.1 with -DAMDGPU_TARGETS=gfx1010, so if a stock
+      # ROCm of that vintage sees gfx1151 here, the next step is a container
+      # build with the target changed. If it does not, the next step is a
+      # TheRock nightly, which is what candle needed on this same silicon, and
+      # that is a materially larger piece of work.
+      - name: ROCm reconnaissance
+        run: |
+          echo "--- rocminfo"
+          if command -v rocminfo >/dev/null 2>&1; then
+            rocminfo | grep -iE 'Name:|gfx' | head -20
+          else
+            echo "rocminfo not installed"
+          fi
+          echo "--- hipcc"
+          command -v hipcc >/dev/null 2>&1 && hipcc --version | head -3 || echo "hipcc not installed"
+          echo "--- /opt/rocm"
+          ls -d /opt/rocm* 2>/dev/null || echo "no /opt/rocm"
+          echo "--- kernel amdgpu"
+          lsmod 2>/dev/null | grep -c '^amdgpu' | sed 's/^/amdgpu modules: /'
+
+      # The toolchain the real build will need, reported for the same reason.
+      # ollama is Go plus a CMake superbuild, and neither is guaranteed present
+      # on a host prepared for something else.
+      - name: Build toolchain reconnaissance
+        run: |
+          command -v go >/dev/null 2>&1 && go version || echo "go not installed"
+          command -v cmake >/dev/null 2>&1 && cmake --version | head -1 || echo "cmake not installed"
+          command -v git >/dev/null 2>&1 && git --version || echo "git not installed"
