@@ -76,6 +76,30 @@ jobs:
           key: ccache-rocm-gfx1151-${{ github.sha }}
           restore-keys: ccache-rocm-gfx1151-
 
+      # Upstream's own Install Go step, verbatim apart from the `sudo` branch
+      # that only applies to their container-less CPU leg. Their ROCm preset
+      # does not set install-go and does not need to, because it builds the
+      # backend and stops. We need the base target too -- see below -- and that
+      # one is Go.
+      - name: Install Go
+        run: |
+          GO_VERSION=$(awk '/^go / { print $2 }' go.mod)
+          curl -fsSL "https://golang.org/dl/go${GO_VERSION}.linux-$(dpkg --print-architecture).tar.gz" | tar xz -C /usr/local
+          echo "/usr/local/go/bin" >> $GITHUB_PATH
+
+      # Two targets into one superbuild directory, which is one more than
+      # upstream builds here and the reason is the second job.
+      #
+      # ollama-llama-server-rocm_v7_2 produces lib/ollama/rocm_v7_2/ -- the HIP
+      # backend and the ROCm runtime it bundles, and nothing that can execute.
+      # There is no llama-server in it and no libggml-base.so, because those
+      # belong to the base target. Upstream never notices: their ROCm leg
+      # asserts libggml-hip.so exists and stops, so a payload that cannot run is
+      # exactly as useful to them as one that can.
+      #
+      # It is not useful to us. ollama-local puts llama-server and the base
+      # libraries at lib/ollama/, beside the rocm_v7_2/ directory, and the two
+      # together are a thing that starts.
       - name: Build native superbuild
         run: |
           cmake -S . -B build/local-superbuild-rocm_v7_2 \
@@ -84,7 +108,10 @@ jobs:
             -DCMAKE_PREFIX_PATH=/opt/rocm
           CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) cmake --build build/local-superbuild-rocm_v7_2 \
             --target ollama-llama-server-rocm_v7_2 -- -l $(nproc)
+          CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) cmake --build build/local-superbuild-rocm_v7_2 \
+            --target ollama-local -- -l $(nproc)
           test -e build/local-superbuild-rocm_v7_2/lib/ollama/rocm_v7_2/libggml-hip.so
+          test -e build/local-superbuild-rocm_v7_2/lib/ollama/llama-server
 
       - name: What was built
         run: |
@@ -129,8 +156,14 @@ jobs:
       - name: Does the artifact resolve against the host ROCm
         run: |
           chmod -R +x payload
+          # Same two directories the run step uses, and for the same reason:
+          # libggml-hip.so links against libggml-base.so.0 from the base target,
+          # which lives at the payload root rather than beside it.
+          export LD_LIBRARY_PATH="$PWD/payload:$PWD/payload/rocm_v7_2:/opt/rocm/lib:${LD_LIBRARY_PATH:-}"
           echo "--- host rocm"
           ls -d /opt/rocm*
+          echo "--- payload layout"
+          find payload -maxdepth 2 -type f -printf '%10s  %p\n' | sort -k2 | head -30
           echo "--- ldd libggml-hip.so"
           ldd payload/rocm_v7_2/libggml-hip.so
           echo "--- unresolved"
@@ -142,7 +175,11 @@ jobs:
 
       - name: Execute it
         run: |
-          export LD_LIBRARY_PATH="$PWD/payload/rocm_v7_2:/opt/rocm/lib:${LD_LIBRARY_PATH:-}"
+          # Both directories. The base libraries sit at the payload root and the
+          # HIP backend a level down in rocm_v7_2/, and llama-server needs to
+          # resolve against both -- the first run of this job named only the
+          # second and died on libggml-base.so.0.
+          export LD_LIBRARY_PATH="$PWD/payload:$PWD/payload/rocm_v7_2:/opt/rocm/lib:${LD_LIBRARY_PATH:-}"
           server=$(find payload -name 'llama-server' -type f | head -1)
           echo "server: ${server:-<none found>}"
           [ -n "$server" ] || { echo "no llama-server in the payload"; exit 1; }
