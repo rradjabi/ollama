@@ -184,8 +184,30 @@ jobs:
           echo "server: ${server:-<none found>}"
           [ -n "$server" ] || { echo "no llama-server in the payload"; exit 1; }
           "$server" --version
-          # Best effort: the flag has moved between llama.cpp releases, and a
-          # missing flag is not a gfx1151 result either way. The device list is
-          # what we are after -- it is the first evidence the HIP backend loads
-          # and enumerates this iGPU outside a container.
-          "$server" --list-devices || echo "(--list-devices unavailable on this build)"
+
+          # ggml discovers backends by scanning the directory its executable
+          # sits in. ollama puts each backend a level down -- rocm_v7_2/ here --
+          # because its own Go loader knows where to look, and llama-server
+          # invoked directly does not. Left alone, this reports
+          # "Available devices: (none)" on a machine with a working HIP
+          # backend sitting one directory away, which is what the first green
+          # run of this job did.
+          #
+          # Copied rather than symlinked, and only the backend: the ROCm
+          # libraries it needs stay where they are and are reached through
+          # LD_LIBRARY_PATH above.
+          cp payload/rocm_v7_2/libggml-hip.so "$(dirname "$server")/"
+
+          echo "--- devices"
+          "$server" --list-devices | tee /tmp/devices.txt
+
+          # The actual assertion, and the reason this job exists. A run that
+          # reports no device is a failure even though every command in it
+          # succeeded -- that is precisely the state upstream's build-only job
+          # cannot distinguish from success.
+          if grep -qiE 'ROCm|HIP|gfx1151|Radeon' /tmp/devices.txt; then
+            echo "PASS: the HIP backend enumerated the iGPU"
+          else
+            echo "FAIL: llama-server loaded but reported no ROCm device"
+            exit 1
+          fi
