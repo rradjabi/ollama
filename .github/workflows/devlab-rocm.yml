@@ -1,0 +1,154 @@
+name: DevLab ROCm gfx1151
+
+# Lives in rradjabi/ollama on devlab/ephemeral-ci as
+# .github/workflows/devlab-rocm.yml. Issue #127.
+#
+# This is a deliberate near-copy of the `linux` / `preset: ROCm` leg of
+# ollama's own .github/workflows/test.yaml, and the resemblance is the point.
+# The destination for this work is upstream, so the job that gets proposed there
+# should differ from the one they already run by as little as possible --
+# ideally by the architecture and the runner, and nothing else. Read the two
+# side by side before changing anything here.
+#
+# What differs from upstream's ROCm leg, in full:
+#
+#   1. -DAMDGPU_TARGETS=gfx1151 rather than gfx1010. Theirs is RDNA1, a 2019
+#      part, and the only AMD architecture in their file.
+#   2. runs-on names this pool rather than `linux`.
+#   3. A second job that runs the artifact on the host. Upstream has no
+#      equivalent because upstream has no machine to run it on -- their ROCm leg
+#      asserts the .so exists and stops there, as does every other GPU job in
+#      that file. That gap is the reason this repository is watched.
+#   4. A chown at the end of the build. See the comment on that step.
+#
+# The split between the two jobs is not tidiness. Building in the container
+# keeps the toolchain byte-identical to upstream's and touches no host state.
+# Running the artifact outside the container avoids ollama#16462, an open report
+# of Strix Halo VRAM detection breaking specifically under container
+# deployment -- a real bug, and not one we want to spend the first gfx1151 run
+# debugging by accident. That the two halves are compatible at all is a version
+# coincidence worth stating: these hosts carry ROCm 7.2.1, which is the same
+# version as the rocm/dev-ubuntu-22.04:7.2.1 tag upstream builds in. If either
+# side moves, this split needs rechecking, and `ldd` in the second job is what
+# will catch it.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build ROCm gfx1151
+    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    # The first container job this pool has run. The hosts are ready for it and
+    # nothing had to be installed: Docker 29.7.2 is present and in use, the
+    # runner account is in the `docker` group, and Docker's root directory is
+    # /mnt/scratch/docker on the 1.7T volume rather than the 32G root -- which
+    # matters, because a ROCm dev image does not fit on the latter.
+    #
+    # No device passthrough here on purpose. A build never touches the GPU, so
+    # the container needs no --device=/dev/kfd and this stays a faithful copy of
+    # upstream's job. The second job is where the hardware is needed.
+    container: rocm/dev-ubuntu-22.04:7.2.1
+    steps:
+      - uses: actions/checkout@v4
+
+      # Upstream's setup step, minus the branches for presets we do not build.
+      # The CMake tarball is theirs and is kept rather than dropped: the host
+      # has 3.31.12, but nothing in a container job can see the host's CMake,
+      # and pinning it here is what makes the build reproducible off this pool.
+      - name: Install build dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update
+          apt-get install -y cmake ccache curl git rocm-libs
+          curl -fsSL https://github.com/Kitware/CMake/releases/download/v3.31.2/cmake-3.31.2-linux-$(uname -m).tar.gz \
+            | tar xz -C /usr/local --strip-components 1
+
+      # Upstream caches ccache the same way. Worth keeping even though this pool
+      # wipes the runner workspace between jobs: actions/cache is served by
+      # GitHub rather than the host, so it is one of the few caches that does
+      # survive an ephemeral runner. If cold builds turn out to be the reason
+      # this job cannot run per-PR, this line is where the fix goes first.
+      - uses: actions/cache@v4
+        with:
+          path: /github/home/.cache/ccache
+          key: ccache-rocm-gfx1151-${{ github.sha }}
+          restore-keys: ccache-rocm-gfx1151-
+
+      - name: Build native superbuild
+        run: |
+          cmake -S . -B build/local-superbuild-rocm_v7_2 \
+            -DOLLAMA_LLAMA_BACKENDS=rocm_v7_2 \
+            -DAMDGPU_TARGETS=gfx1151 \
+            -DCMAKE_PREFIX_PATH=/opt/rocm
+          CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) cmake --build build/local-superbuild-rocm_v7_2 \
+            --target ollama-llama-server-rocm_v7_2 -- -l $(nproc)
+          test -e build/local-superbuild-rocm_v7_2/lib/ollama/rocm_v7_2/libggml-hip.so
+
+      - name: What was built
+        run: |
+          find build/local-superbuild-rocm_v7_2/lib/ollama -maxdepth 2 -type f -printf '%10s  %p\n' | sort -k2
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rocm-gfx1151
+          path: build/local-superbuild-rocm_v7_2/lib/ollama/
+          retention-days: 7
+
+      # Container jobs on a self-hosted runner write into a bind-mounted
+      # workspace as root, and the runner then cleans up as an unprivileged
+      # account and cannot remove what it did not create. That failure does not
+      # land on this run -- it lands on whatever runs on this host next, as a
+      # checkout that cannot delete the previous tree, which is a bad way to
+      # find out. `if: always()` because a failed build leaves root-owned
+      # objects behind exactly like a successful one.
+      #
+      # /__w is where the runner mounts its work directory inside a container,
+      # and it is created by the runner account, so its ownership is the answer
+      # rather than a guessed uid.
+      - name: Return the workspace to the runner account
+        if: always()
+        run: chown -R "$(stat -c '%u:%g' /__w)" /__w
+
+  run:
+    name: Run on gfx1151
+    needs: build
+    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    # No container. This job is the half upstream cannot do.
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: rocm-gfx1151
+          path: payload
+
+      # The check that actually validates building in one place and running in
+      # another. If the container's ROCm and the host's ever diverge, this is
+      # where it shows up -- as an unresolved soname, before anything tries to
+      # load a model and reports something less legible.
+      - name: Does the artifact resolve against the host ROCm
+        run: |
+          chmod -R +x payload
+          echo "--- host rocm"
+          ls -d /opt/rocm*
+          echo "--- ldd libggml-hip.so"
+          ldd payload/rocm_v7_2/libggml-hip.so
+          echo "--- unresolved"
+          if ldd payload/rocm_v7_2/libggml-hip.so | grep -q "not found"; then
+            echo "FAIL: unresolved libraries above"
+            exit 1
+          fi
+          echo "all resolved"
+
+      - name: Execute it
+        run: |
+          export LD_LIBRARY_PATH="$PWD/payload/rocm_v7_2:/opt/rocm/lib:${LD_LIBRARY_PATH:-}"
+          server=$(find payload -name 'llama-server' -type f | head -1)
+          echo "server: ${server:-<none found>}"
+          [ -n "$server" ] || { echo "no llama-server in the payload"; exit 1; }
+          "$server" --version
+          # Best effort: the flag has moved between llama.cpp releases, and a
+          # missing flag is not a gfx1151 result either way. The device list is
+          # what we are after -- it is the first evidence the HIP backend loads
+          # and enumerates this iGPU outside a container.
+          "$server" --list-devices || echo "(--list-devices unavailable on this build)"
