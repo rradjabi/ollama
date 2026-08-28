@@ -1,0 +1,132 @@
+name: DevLab gfx1151 integration
+
+# Runs ollama's OWN integration suite on gfx1151, which is the point: these are
+# their tests and their assertions, not ours. integration/README.md documents
+# three scopes; `fast` is "quick runner/model smoke coverage" and is the one
+# sized for a nightly.
+#
+# No workflow in ollama runs any of them. They are gated behind the
+# `integration` build tag and invoked by hand, so the suite exists and CI has
+# never executed it on any GPU of any vendor.
+#
+# Two of those files map straight onto open gfx1151 reports:
+#   context_test.go     -- #17895, wrong output above ~4k tokens
+#   concurrency_test.go -- #17847, KV state bleeding across sequential requests
+#
+# rradjabi/ephemeral-ci#127.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build gfx1151
+    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    container: rocm/dev-ubuntu-22.04:7.2.1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update
+          apt-get install -y cmake ccache curl git rocm-libs
+          curl -fsSL https://github.com/Kitware/CMake/releases/download/v3.31.2/cmake-3.31.2-linux-$(uname -m).tar.gz \
+            | tar xz -C /usr/local --strip-components 1
+
+      - name: Install Go
+        run: |
+          GO_VERSION=$(awk '/^go / { print $2 }' go.mod)
+          curl -fsSL "https://golang.org/dl/go${GO_VERSION}.linux-$(dpkg --print-architecture).tar.gz" | tar xz -C /usr/local
+          echo "/usr/local/go/bin" >> $GITHUB_PATH
+
+      # ollama-local is what puts the `ollama` binary at the top of the source
+      # tree, which integration/README.md requires ("The integration tests
+      # expect to find an ollama binary at the top of the tree").
+      - name: Build
+        run: |
+          cmake -S . -B build/gfx1151 \
+            -DOLLAMA_LLAMA_BACKENDS=rocm_v7_2 \
+            -DAMDGPU_TARGETS=gfx1151 \
+            -DCMAKE_PREFIX_PATH=/opt/rocm
+          CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) cmake --build build/gfx1151 --target ollama-llama-server-rocm_v7_2 -- -l $(nproc)
+          CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) cmake --build build/gfx1151 --target ollama-local -- -l $(nproc)
+          ls -l ollama || echo "no ollama binary at tree root"
+          ./ollama --version || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gfx1151-integration
+          path: |
+            ollama
+            build/gfx1151/lib/ollama/
+          retention-days: 3
+
+      - name: Restore workspace ownership
+        if: always()
+        run: chown -R "$(stat -c '%u:%g' /__w)" /__w
+
+  integration:
+    name: integration,fast on gfx1151
+    needs: build
+    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    timeout-minutes: 90
+    steps:
+      # The source tree is needed as well as the binaries -- `go test` compiles
+      # the suite from source.
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: gfx1151-integration
+          path: artifact
+
+      - name: Install Go
+        run: |
+          GO_VERSION=$(awk '/^go / { print $2 }' go.mod)
+          curl -fsSL "https://golang.org/dl/go${GO_VERSION}.linux-$(dpkg --print-architecture).tar.gz" | tar xz -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/go/bin" >> $GITHUB_PATH
+
+      # The binary looks for its backends at lib/ollama relative to itself, so
+      # the layout has to be reassembled the way the build left it.
+      - name: Lay the tree out the way the suite expects
+        run: |
+          cp artifact/ollama ./ollama
+          chmod +x ./ollama
+          mkdir -p lib
+          cp -r artifact/build/gfx1151/lib/ollama lib/ollama
+          chmod -R +x lib/ollama
+          ls -l ./ollama
+          find lib/ollama -maxdepth 1 -printf '  %p\n' | head
+          ./ollama --version
+
+      - name: Which device does the server see
+        run: |
+          ./ollama serve > /tmp/serve.log 2>&1 &
+          for i in $(seq 1 30); do
+            ./ollama list >/dev/null 2>&1 && break
+            sleep 2
+          done
+          grep -iE 'rocm|gfx|radeon|inference compute' /tmp/serve.log | head -20 || true
+          pkill -f 'ollama serve' || true
+
+      # The real thing. Their suite, their assertions, on gfx1151.
+      - name: go test -tags=integration,fast
+        env:
+          CGO_ENABLED: '1'
+          OLLAMA_TEST_LOG_SERVER: '1'
+        run: |
+          go test -tags=integration,fast -v -count 1 -timeout 60m ./integration/ 2>&1 | tee /tmp/integration.log
+          echo "exit: ${PIPESTATUS[0]}"
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "--- pass/fail tally"
+          grep -cE '^(=== RUN|--- PASS|--- FAIL|--- SKIP)' /tmp/integration.log 2>/dev/null || true
+          for k in "--- PASS" "--- FAIL" "--- SKIP"; do
+            printf '%-10s %s\n' "$k" "$(grep -c -- "$k" /tmp/integration.log 2>/dev/null || echo 0)"
+          done
+          echo "--- failures"
+          grep -- '--- FAIL' /tmp/integration.log 2>/dev/null | head -30 || echo "none"
