@@ -1,0 +1,120 @@
+name: test-gfx1151
+
+# Runs the integration suite on AMD Strix Halo (gfx1151), an architecture
+# shipped by the rocm_v7_2_linux preset and listed in docs/gpu.mdx as
+# "Ryzen AI Max+ 395".
+#
+# integration/README.md documents three scopes and no workflow runs any of
+# them, so the suite has never executed in CI on a GPU of any vendor. This
+# runs the `fast` scope, described there as "quick runner/model smoke
+# coverage".
+#
+# It executes on donated hardware through an ephemeral self-hosted pool: a
+# runner is created when a job is queued and destroyed when it finishes, and
+# nothing persists between jobs. See the pull request for how the pool is
+# operated, what permissions it needs, and how to revoke it.
+#
+# workflow_dispatch only, deliberately. There is no pull_request trigger, so
+# the runners never execute code from a fork -- that is the usual objection to
+# self-hosted runners and it is designed out rather than mitigated. Adding a
+# nightly `schedule:` is a two-line change whenever you want one.
+#
+# Nothing depends on this workflow. Deleting this file, or uninstalling the
+# app that registers the runners, disables it completely.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  # Built in the container the ROCm leg of test.yaml uses, so the toolchain is
+  # identical and only the architecture differs.
+  build:
+    if: github.repository == 'ollama/ollama'
+    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    container: rocm/dev-ubuntu-22.04:7.2.1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update
+          apt-get install -y cmake ccache curl git rocm-libs
+          curl -fsSL https://github.com/Kitware/CMake/releases/download/v3.31.2/cmake-3.31.2-linux-$(uname -m).tar.gz \
+            | tar xz -C /usr/local --strip-components 1
+
+      - name: Install Go
+        run: |
+          GO_VERSION=$(awk '/^go / { print $2 }' go.mod)
+          curl -fsSL "https://golang.org/dl/go${GO_VERSION}.linux-$(dpkg --print-architecture).tar.gz" | tar xz -C /usr/local
+          echo "/usr/local/go/bin" >> $GITHUB_PATH
+
+      - uses: actions/cache@v4
+        with:
+          path: /github/home/.cache/ccache
+          key: ccache-gfx1151-${{ github.sha }}
+          restore-keys: ccache-gfx1151-
+
+      # ollama-local is what places the binary at the top of the tree, which
+      # integration/README.md requires.
+      - name: Build
+        run: |
+          cmake -S . -B build/gfx1151 \
+            -DOLLAMA_LLAMA_BACKENDS=rocm_v7_2 \
+            -DAMDGPU_TARGETS=gfx1151 \
+            -DCMAKE_PREFIX_PATH=/opt/rocm
+          CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) cmake --build build/gfx1151 --target ollama-llama-server-rocm_v7_2 -- -l $(nproc)
+          CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) cmake --build build/gfx1151 --target ollama-local -- -l $(nproc)
+          ./ollama --version
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gfx1151
+          path: |
+            ollama
+            build/gfx1151/lib/ollama/
+          retention-days: 3
+
+      # A container job on a self-hosted runner writes the workspace as root
+      # and the runner cleans up unprivileged; without this the next job on
+      # that machine cannot remove the tree.
+      - name: Restore workspace ownership
+        if: always()
+        run: chown -R "$(stat -c '%u:%g' /__w)" /__w
+
+  # Outside the container on purpose: #16462 reports Strix Halo VRAM detection
+  # breaking under container deployment, which is not what this is measuring.
+  integration:
+    if: github.repository == 'ollama/ollama'
+    needs: build
+    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: gfx1151
+          path: artifact
+
+      - name: Install Go
+        run: |
+          GO_VERSION=$(awk '/^go / { print $2 }' go.mod)
+          curl -fsSL "https://golang.org/dl/go${GO_VERSION}.linux-$(dpkg --print-architecture).tar.gz" | tar xz -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/go/bin" >> $GITHUB_PATH
+
+      - name: Restore the build layout
+        run: |
+          cp artifact/ollama ./ollama
+          chmod +x ./ollama
+          mkdir -p lib
+          cp -r artifact/build/gfx1151/lib/ollama lib/ollama
+          chmod -R +x lib/ollama
+          ./ollama --version
+
+      - name: go test -tags=integration,fast
+        env:
+          CGO_ENABLED: '1'
+          OLLAMA_TEST_LOG_SERVER: '1'
+        run: go test -tags=integration,fast -v -count 1 -timeout 60m ./integration/
