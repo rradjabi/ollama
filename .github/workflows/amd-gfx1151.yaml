@@ -1,0 +1,124 @@
+name: amd-gfx1151
+
+# Nightly build and execution on AMD Strix Halo (gfx1151), one of the
+# architectures shipped by the rocm_v7_2_linux preset and listed in
+# docs/gpu.mdx as "Ryzen AI Max+ 395".
+#
+# This is the only job in this repository that runs a model on a GPU. It
+# executes on donated hardware through an ephemeral self-hosted runner pool --
+# each job gets a runner that is created when the job is queued and destroyed
+# when it finishes. See the pull request for how the pool is operated, what
+# permissions it needs, and how to revoke it.
+#
+# Deliberately not triggered by pull_request. The runners only ever execute
+# code that is already on this repository's default branch, so a fork cannot
+# reach them. This is the usual objection to self-hosted runners and it is
+# designed out rather than mitigated.
+#
+# Nothing depends on this workflow. Deleting this file, or uninstalling the
+# app that registers the runners, disables it completely with no other change.
+
+on:
+  schedule:
+    - cron: '17 7 * * *'
+  workflow_dispatch:
+
+jobs:
+  # Built in the same container the ROCm leg of test.yaml uses, so the
+  # toolchain is identical and only the architecture differs.
+  build:
+    if: github.repository == 'ollama/ollama'
+    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    container: rocm/dev-ubuntu-22.04:7.2.1
+    # Advisory while the runner pool is new; revisit once it has a track record.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update
+          apt-get install -y cmake ccache curl git rocm-libs
+          curl -fsSL https://github.com/Kitware/CMake/releases/download/v3.31.2/cmake-3.31.2-linux-$(uname -m).tar.gz \
+            | tar xz -C /usr/local --strip-components 1
+
+      - name: Install Go
+        run: |
+          GO_VERSION=$(awk '/^go / { print $2 }' go.mod)
+          curl -fsSL "https://golang.org/dl/go${GO_VERSION}.linux-$(dpkg --print-architecture).tar.gz" | tar xz -C /usr/local
+          echo "/usr/local/go/bin" >> $GITHUB_PATH
+
+      - uses: actions/cache@v4
+        with:
+          path: /github/home/.cache/ccache
+          key: ccache-gfx1151-${{ github.sha }}
+          restore-keys: ccache-gfx1151-
+
+      # Two targets. The ROCm one produces the backend and the ROCm runtime it
+      # bundles; llama-server and the base libraries come from ollama-local,
+      # and both are needed for anything to execute.
+      - name: Build
+        run: |
+          cmake -S . -B build/gfx1151 \
+            -DOLLAMA_LLAMA_BACKENDS=rocm_v7_2 \
+            -DAMDGPU_TARGETS=gfx1151 \
+            -DCMAKE_PREFIX_PATH=/opt/rocm
+          CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) cmake --build build/gfx1151 --target ollama-llama-server-rocm_v7_2 -- -l $(nproc)
+          CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) cmake --build build/gfx1151 --target ollama-local -- -l $(nproc)
+          test -e build/gfx1151/lib/ollama/rocm_v7_2/libggml-hip.so
+          test -e build/gfx1151/lib/ollama/llama-server
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gfx1151
+          path: build/gfx1151/lib/ollama/
+          retention-days: 3
+
+      # A container job on a self-hosted runner writes the workspace as root,
+      # and the runner cleans up unprivileged. Without this the next job on
+      # that machine cannot remove the tree.
+      - name: Restore workspace ownership
+        if: always()
+        run: chown -R "$(stat -c '%u:%g' /__w)" /__w
+
+  # Outside the container on purpose. #16462 reports Strix Halo VRAM detection
+  # breaking under container deployment, which is not what this job is meant
+  # to be measuring.
+  run:
+    if: github.repository == 'ollama/ollama'
+    needs: build
+    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    continue-on-error: true
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: gfx1151
+          path: payload
+
+      - name: Check the artifact resolves against the host ROCm
+        run: |
+          chmod -R +x payload
+          export LD_LIBRARY_PATH="$PWD/payload:$PWD/payload/rocm_v7_2:/opt/rocm/lib:${LD_LIBRARY_PATH:-}"
+          ldd payload/rocm_v7_2/libggml-hip.so
+          if ldd payload/rocm_v7_2/libggml-hip.so | grep -q "not found"; then
+            echo "unresolved libraries above"
+            exit 1
+          fi
+
+      - name: Enumerate the GPU
+        run: |
+          export LD_LIBRARY_PATH="$PWD/payload:$PWD/payload/rocm_v7_2:/opt/rocm/lib:${LD_LIBRARY_PATH:-}"
+          server=payload/llama-server
+          "$server" --version
+          # ggml discovers backends beside its executable; the build places
+          # each one in its own directory.
+          cp payload/rocm_v7_2/libggml-hip.so "$(dirname "$server")/"
+          "$server" --list-devices | tee devices.txt
+          # A run that reports no device is a failure even though every command
+          # in it succeeded. That state is what a build-only job cannot detect.
+          grep -qiE 'ROCm|gfx1151|Radeon' devices.txt || {
+            echo "llama-server started but reported no ROCm device"
+            exit 1
+          }
