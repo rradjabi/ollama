@@ -38,7 +38,7 @@ on:
 jobs:
   build:
     name: Build ROCm gfx1151
-    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    runs-on: [self-hosted, Linux, devlab-dispatch, strix-halo]
     # The first container job this pool has run. The hosts are ready for it and
     # nothing had to be installed: Docker 29.7.2 is present and in use, the
     # runner account is in the `docker` group, and Docker's root directory is
@@ -141,7 +141,7 @@ jobs:
   run:
     name: Run on gfx1151
     needs: build
-    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    runs-on: [self-hosted, Linux, devlab-dispatch, strix-halo]
     # No container. This job is the half upstream cannot do.
     steps:
       - uses: actions/download-artifact@v4
