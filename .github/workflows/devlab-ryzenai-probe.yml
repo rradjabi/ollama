@@ -1,0 +1,71 @@
+name: DevLab Ryzen AI probe
+
+# Lives in rradjabi/ollama on the branch named in the push trigger below, as
+# .github/workflows/devlab-ryzenai-probe.yml. Nothing watches
+# rradjabi/ephemeral-ci, so it does not run from where this copy lives.
+#
+# This proves the Ryzen AI 1.8.0 install on the pool without touching the
+# repository that needs it. lemonade-sdk/ryzenai-sd-server's build failed at
+# CMake configure because no Windows host had the SDK; this reruns exactly that
+# configure against exactly that source, and stops there. It deliberately does
+# not run `cmake --build`: the configure step is the one that failed and the one
+# the install was meant to fix, and a full build would hold a machine for
+# minutes to re-answer a question the configure already answers.
+#
+# Asking for the repo's own job instead would have been the obvious test and is
+# not deterministic: their runs-on names no capability, so it matches all five
+# Windows Halos and only one of them has the SDK today. Naming
+# 'ryzen-ai-1.8.0' is how this lands where the answer is.
+on:
+  push:
+    branches:
+      - devlab/ryzenai-probe
+  workflow_dispatch:
+
+jobs:
+  probe:
+    name: Ryzen AI 1.8.0 - configure
+    # No host pin. The label is the point of the exercise: it currently resolves
+    # to one machine, so this is as deterministic as a pin, and unlike a pin it
+    # keeps working -- and keeps meaning the same thing -- once the other four
+    # hosts are installed.
+    runs-on: [self-hosted, Windows, devlab-dispatch, ryzen-ai-1.8.0]
+    timeout-minutes: 20
+    steps:
+      - name: What the label promises
+        shell: powershell
+        run: |
+          foreach ($p in @(
+              "C:\Program Files\RyzenAI\1.8.0\onnxruntime\lib",
+              "C:\Program Files\RyzenAI\1.8.0\deployment",
+              "C:\Program Files\RyzenAI\1.8.0\GenAI-SD\lib")) {
+              "{0,-52} {1}" -f $p, (Test-Path $p)
+          }
+          Get-ChildItem "C:\Program Files\RyzenAI\1.8.0\onnxruntime\lib" |
+              Select-Object -ExpandProperty Name
+
+      - name: Fetch the source that failed
+        shell: powershell
+        run: |
+          git clone --depth 1 https://github.com/lemonade-sdk/ryzenai-sd-server.git src
+          if ($LASTEXITCODE -ne 0) { throw "clone failed" }
+
+      # The same generator, architecture and -D flags as
+      # lemonade-sdk/ryzenai-sd-server's build_and_release.yml. Copied rather
+      # than simplified: a probe that configures differently from the real job
+      # can pass while the real job still fails.
+      - name: CMake configure, as the real job does it
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          cd src
+          mkdir build | Out-Null
+          cd build
+          cmake .. -G "Visual Studio 17 2022" -A x64 `
+            -DRUNTIME_DLLS_DIR="C:\Program Files\RyzenAI\1.8.0\deployment" `
+            -DLIB_DIRECTORY="C:\Program Files\RyzenAI\1.8.0\GenAI-SD\lib"
+          if ($LASTEXITCODE -ne 0) {
+              Write-Host "CONFIGURE FAILED -- the install did not satisfy the build"
+              exit $LASTEXITCODE
+          }
+          Write-Host "CONFIGURE OK on $env:COMPUTERNAME"
