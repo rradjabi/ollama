@@ -21,7 +21,7 @@ on:
 jobs:
   build:
     name: Build gfx1151
-    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    runs-on: [self-hosted, Linux, devlab-dispatch, strix-halo]
     container: rocm/dev-ubuntu-22.04:7.2.1
     steps:
       - uses: actions/checkout@v4
@@ -70,7 +70,7 @@ jobs:
   integration:
     name: integration,fast on gfx1151
     needs: build
-    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    runs-on: [self-hosted, Linux, devlab-dispatch, strix-halo]
     timeout-minutes: 90
     steps:
       # The source tree is needed as well as the binaries -- `go test` compiles

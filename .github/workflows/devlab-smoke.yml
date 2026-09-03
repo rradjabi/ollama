@@ -24,11 +24,11 @@ on:
 jobs:
   smoke:
     name: Strix Halo - Linux
-    # `ephemeral` alongside `strix-halo` is not redundant. It is the label that
-    # says this job wants a runner that does not exist yet, and it is what keeps
-    # the DevLab pool and the XSJ static runners from both answering. See
-    # pool.match_labels: a job naming only generic labels is refused outright.
-    runs-on: [self-hosted, Linux, strix-halo, ephemeral]
+    # `devlab-dispatch` is what reaches this pool; `strix-halo` only narrows it
+    # to Halo silicon. Naming the silicon alone is a description of the hardware
+    # rather than a request for these machines, and other AMD fleets carry it
+    # honestly. See pool.match_labels.
+    runs-on: [self-hosted, Linux, devlab-dispatch, strix-halo]
     steps:
       - name: Hello
         run: echo "Hello from $(hostname) - $(uname -sr)"
