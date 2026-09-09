@@ -76,10 +76,18 @@ jobs:
     # models (llama3.2:1b, qwen3-embedding, gemma4:e2b, qwen3.5:2b, lfm2.5)
     # and the default ~/.ollama path lands on root. RUNNER_TEMP is on the same
     # 1.7TB scratch volume as the workspace and the runner already owns it.
-    env:
-      OLLAMA_HOME: ${{ runner.temp }}/ollama
-      OLLAMA_MODELS: ${{ runner.temp }}/ollama/models
+    # runner.temp is not available in job-level env, so the first step exports
+    # OLLAMA_HOME and OLLAMA_MODELS for all subsequent steps via GITHUB_ENV.
     steps:
+      - name: Set model storage to scratch volume
+        run: |
+          echo "OLLAMA_HOME=$RUNNER_TEMP/ollama" >> "$GITHUB_ENV"
+          echo "OLLAMA_MODELS=$RUNNER_TEMP/ollama/models" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/ollama/models"
+          df -h "$(dirname "$RUNNER_TEMP")"
+          echo "OLLAMA_HOME=$RUNNER_TEMP/ollama"
+          echo "OLLAMA_MODELS=$RUNNER_TEMP/ollama/models"
+
       # The source tree is needed as well as the binaries -- `go test` compiles
       # the suite from source.
       - uses: actions/checkout@v4
@@ -94,13 +102,6 @@ jobs:
           GO_VERSION=$(awk '/^go / { print $2 }' go.mod)
           curl -fsSL "https://golang.org/dl/go${GO_VERSION}.linux-$(dpkg --print-architecture).tar.gz" | tar xz -C "$RUNNER_TEMP"
           echo "$RUNNER_TEMP/go/bin" >> $GITHUB_PATH
-
-      - name: Prepare scratch volume for models
-        run: |
-          mkdir -p "$OLLAMA_HOME" "$OLLAMA_MODELS"
-          df -h /mnt/scratch
-          echo "OLLAMA_HOME=$OLLAMA_HOME"
-          echo "OLLAMA_MODELS=$OLLAMA_MODELS"
 
       # The binary looks for its backends at lib/ollama relative to itself, so
       # the layout has to be reassembled the way the build left it.
