@@ -74,11 +74,11 @@ jobs:
     timeout-minutes: 90
     # The root filesystem on these hosts is 32GB. The fast suite pulls multiple
     # models (llama3.2:1b, qwen3-embedding, gemma4:e2b, qwen3.5:2b, lfm2.5)
-    # and the default ~/.ollama path lands on root. Point all ollama state at
-    # the 1.7TB scratch volume so model downloads do not fill the disk.
+    # and the default ~/.ollama path lands on root. RUNNER_TEMP is on the same
+    # 1.7TB scratch volume as the workspace and the runner already owns it.
     env:
-      OLLAMA_HOME: /mnt/scratch/ollama-integration
-      OLLAMA_MODELS: /mnt/scratch/ollama-integration/models
+      OLLAMA_HOME: ${{ runner.temp }}/ollama
+      OLLAMA_MODELS: ${{ runner.temp }}/ollama/models
     steps:
       # The source tree is needed as well as the binaries -- `go test` compiles
       # the suite from source.
